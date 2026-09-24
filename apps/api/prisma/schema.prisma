@@ -1,0 +1,411 @@
+// MyIDx data model.
+//
+// Two rules shape this schema:
+//  1. Country-agnostic. No table encodes one country's documents. `CountryIdType`
+//     rows map a generic document class onto a local label per country, so a new
+//     market is inserted data, not a migration.
+//  2. Sensitive values are never stored in plaintext. Columns suffixed `Encrypted`
+//     hold AES-256-GCM ciphertext keyed per user; only masked/derived fields are
+//     queryable in the clear.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Reference data
+// ---------------------------------------------------------------------------
+
+model Country {
+  code        String          @id @db.Char(2) // ISO 3166-1 alpha-2
+  displayName String
+  enabled     Boolean         @default(false)
+  idTypes     CountryIdType[]
+  users       User[]
+  merchants   Merchant[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+enum IdDocumentType {
+  PASSPORT
+  NATIONAL_ID
+  DRIVERS_LICENSE
+  VOTER_CARD
+  RESIDENCE_PERMIT
+  TAX_ID
+  UTILITY_BILL
+  BANK_STATEMENT
+  BUSINESS_REGISTRATION
+  OTHER
+}
+
+enum VerificationScope {
+  KYC
+  KYB
+}
+
+model CountryIdType {
+  id                    String            @id @default(cuid())
+  country               Country           @relation(fields: [countryCode], references: [code])
+  countryCode           String            @db.Char(2)
+  type                  IdDocumentType
+  label                 String // local name, e.g. "NIN slip"
+  providerCode          String? // e.g. Sumsub idDocType
+  numberPattern         String?
+  scope                 VerificationScope
+  sufficientForIdentity Boolean           @default(false)
+  provesAddress         Boolean           @default(false)
+  enabled               Boolean           @default(true)
+
+  @@unique([countryCode, type, scope])
+  @@index([countryCode, scope])
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  PENDING_EMAIL
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum MfaMethod {
+  TOTP
+  SMS_OTP
+  EMAIL_OTP
+}
+
+model User {
+  id            String     @id @default(cuid())
+  username      String     @unique
+  email         String     @unique
+  emailVerified Boolean    @default(false)
+  passwordHash  String // argon2id
+  phone         String?    @unique
+  phoneVerified Boolean    @default(false)
+  country       Country    @relation(fields: [countryCode], references: [code])
+  countryCode   String     @db.Char(2)
+  status        UserStatus @default(PENDING_EMAIL)
+
+  // Per-user data key, itself encrypted under ENCRYPTION_MASTER_KEY.
+  dataKeyEncrypted String
+
+  mfaEnabled      Boolean     @default(false)
+  mfaMethods      MfaMethod[] @default([])
+  totpSecretEnc   String? // encrypted TOTP seed
+  // Optional local unlock factors; hashes only, never the raw PIN.
+  pinHash         String?
+  biometricOptIn  Boolean     @default(false)
+
+  creditBalance Int @default(0)
+
+  profile       Profile?
+  documents     IdentityDocument[]
+  attributes    VaultAttribute[]
+  verifications VerificationRun[]
+  grants        AccessGrant[]
+  credits       CreditTransaction[]
+  sessions      Session[]
+  auditEvents   AuditEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([countryCode])
+  @@index([status])
+}
+
+/// Public-facing surface rendered at /u/:username. Deliberately separate from
+/// User so that nothing sensitive can leak into the public projection.
+model Profile {
+  id          String   @id @default(cuid())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      String   @unique
+  displayName String?
+  avatarUrl   String?
+  bio         String?  @db.VarChar(500)
+  isPublic    Boolean  @default(false)
+  showCountry Boolean  @default(false)
+  verified    Boolean  @default(false)
+  verifiedAt  DateTime?
+  updatedAt   DateTime @updatedAt
+}
+
+enum Sensitivity {
+  PUBLIC
+  INTERNAL
+  SENSITIVE
+}
+
+/// Key/value attributes in the identity vault. SENSITIVE rows keep ciphertext in
+/// `valueEncrypted`; non-sensitive rows may use `valuePlain` for querying.
+model VaultAttribute {
+  id                    String      @id @default(cuid())
+  user                  User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId                String
+  key                   String
+  valuePlain            String?
+  valueEncrypted        String?
+  sensitivity           Sensitivity @default(SENSITIVE)
+  verifiedAt            DateTime?
+  sourceVerificationId  String?
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  @@unique([userId, key])
+}
+
+model IdentityDocument {
+  id             String         @id @default(cuid())
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  countryCode    String         @db.Char(2)
+  type           IdDocumentType
+  label          String
+  numberEncrypted String        // full document number, encrypted
+  numberMasked   String         // last 4 only, safe to display
+  fileKeyEncrypted String?      // object-store key for the scan, encrypted
+  issuedAt       DateTime?
+  expiresAt      DateTime?
+  verified       Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([userId])
+  @@index([countryCode, type])
+}
+
+// ---------------------------------------------------------------------------
+// Merchants and OAuth
+// ---------------------------------------------------------------------------
+
+enum MerchantStatus {
+  PENDING_REVIEW
+  ACTIVE
+  SUSPENDED
+}
+
+enum KybStatus {
+  NOT_STARTED
+  IN_REVIEW
+  APPROVED
+  REJECTED
+}
+
+model Merchant {
+  id           String         @id @default(cuid())
+  legalName    String
+  tradingName  String?
+  country      Country        @relation(fields: [countryCode], references: [code])
+  countryCode  String         @db.Char(2)
+  supportEmail String
+  passwordHash String
+  status       MerchantStatus @default(PENDING_REVIEW)
+  kybStatus    KybStatus      @default(NOT_STARTED)
+
+  oauthClients  OAuthClient[]
+  grants        AccessGrant[]
+  verifications VerificationRun[]
+  invoices      MerchantInvoice[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OAuthClient {
+  id               String        @id @default(cuid())
+  merchant         Merchant      @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  merchantId       String
+  clientId         String        @unique
+  clientSecretHash String
+  name             String
+  redirectUris     String[]
+  allowedScopes    String[]
+  active           Boolean       @default(true)
+  grants           AccessGrant[]
+  codes            AuthorizationCode[]
+  createdAt        DateTime      @default(now())
+
+  @@index([merchantId])
+}
+
+/// Short-lived authorization code, PKCE-bound. Single use.
+model AuthorizationCode {
+  id            String      @id @default(cuid())
+  codeHash      String      @unique
+  client        OAuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  clientId      String
+  userId        String
+  scopes        String[]
+  redirectUri   String
+  codeChallenge String
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([expiresAt])
+}
+
+/// A user's consent to a merchant. Revoking sets revokedAt, which invalidates
+/// every access token issued under the grant.
+model AccessGrant {
+  id         String      @id @default(cuid())
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  merchant   Merchant    @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  merchantId String
+  client     OAuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  clientId   String
+  scopes     String[]
+  grantedAt  DateTime    @default(now())
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+
+  @@unique([userId, clientId])
+  @@index([merchantId])
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+enum VerificationStatus {
+  CREATED
+  AWAITING_DOCUMENTS
+  PENDING_PROVIDER
+  APPROVED
+  REJECTED
+  RETRY_REQUESTED
+  EXPIRED
+}
+
+model VerificationRun {
+  id              String             @id @default(cuid())
+  scope           VerificationScope
+  user            User?              @relation(fields: [userId], references: [id])
+  userId          String?
+  merchant        Merchant?          @relation(fields: [merchantId], references: [id])
+  merchantId      String?
+  countryCode     String             @db.Char(2)
+  documentType    IdDocumentType?
+  provider        String             @default("SUMSUB")
+  providerRef     String?            @unique
+  status          VerificationStatus @default(CREATED)
+  rejectionReason String?
+  billable        Boolean            @default(false)
+  createdAt       DateTime           @default(now())
+  completedAt     DateTime?
+
+  @@index([userId])
+  @@index([merchantId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Money
+// ---------------------------------------------------------------------------
+
+enum CreditTxnType {
+  SIGNUP_BONUS
+  PURCHASE
+  SPEND
+  REFUND
+  ADMIN_ADJUSTMENT
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYPAL
+  PAYSTACK
+}
+
+/// Append-only ledger. Balances are derived, rows are never updated.
+model CreditTransaction {
+  id           String        @id @default(cuid())
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String
+  type         CreditTxnType
+  delta        Int
+  balanceAfter Int
+  reason       String?
+  provider     PaymentProvider?
+  providerRef  String?
+  createdAt    DateTime      @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model MerchantInvoice {
+  id          String          @id @default(cuid())
+  merchant    Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  merchantId  String
+  periodStart DateTime
+  periodEnd   DateTime
+  kycCount    Int             @default(0)
+  kybCount    Int             @default(0)
+  amountMinor Int             @default(0)
+  currency    String          @default("USD")
+  provider    PaymentProvider?
+  providerRef String?
+  paidAt      DateTime?
+  createdAt   DateTime        @default(now())
+
+  @@index([merchantId, periodStart])
+}
+
+/// Single row of admin-editable commercial settings.
+model PricingConfig {
+  id                   Int      @id @default(1)
+  signupBonusCredits   Int      @default(500)
+  creditsPerUserAction Int      @default(1)
+  merchantKycUnitPrice Int      @default(100)
+  merchantKybUnitPrice Int      @default(500)
+  currency             String   @default("USD")
+  updatedAt            DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Sessions and audit
+// ---------------------------------------------------------------------------
+
+model Session {
+  id               String   @id @default(cuid())
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId           String
+  refreshTokenHash String   @unique
+  userAgent        String?
+  ipHash           String? // hashed, not raw IP
+  mfaSatisfiedAt   DateTime?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime @default(now())
+
+  @@index([userId])
+}
+
+/// Feeds user-visible activity alerts as well as the compliance trail.
+model AuditEvent {
+  id         String   @id @default(cuid())
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId     String?
+  actorType  String // USER | MERCHANT | ADMIN | SYSTEM
+  actorId    String?
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  ipHash     String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
